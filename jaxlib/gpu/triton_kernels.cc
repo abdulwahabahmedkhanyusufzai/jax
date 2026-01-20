@@ -30,16 +30,21 @@ limitations under the License.
 #include <variant>
 #include <vector>
 
+#include "absl/algorithm/container.h"
 #include "absl/base/optimization.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "absl/flags/flag.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/escaping.h"
 #include "absl/strings/str_format.h"
+#include "absl/strings/str_join.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "jaxlib/gpu/gpu_kernel_helpers.h"
 #include "jaxlib/gpu/triton.pb.h"
@@ -50,6 +55,7 @@ limitations under the License.
 #ifdef JAX_GPU_CUDA
 #include "xla/stream_executor/cuda/cuda_asm_compiler.h"
 #include "xla/stream_executor/cuda/cuda_compute_capability.h"
+#include "xla/stream_executor/gpu/gpu_asm_opts.h"
 #endif  // JAX_GPU_CUDA
 
 #ifdef JAX_GPU_HIP
@@ -58,6 +64,12 @@ limitations under the License.
 #endif  // JAX_GPU_HIP
 
 #define GPU_RETURN_IF_ERROR(expr) JAX_RETURN_IF_ERROR(JAX_AS_STATUS(expr))
+
+ABSL_FLAG(std::vector<std::string>, jax_triton_ptxas_extra_flags, {},
+          "Extra flags to pass to ptxas.");
+ABSL_FLAG(
+    bool, jax_triton_ptxas_device_debug, false,
+    "Pass -g,--device-debug to ptxas to generate debug-friendly device code.");
 
 namespace jax::JAX_GPU_NAMESPACE {
 namespace {
@@ -133,10 +145,29 @@ absl::StatusOr<ModuleImage*> GetModuleImage(std::string kernel_name,
       cc_major, cc_minor,
       has_accelerated_features ? FeatureExtension::kAcceleratedFeatures
                                : FeatureExtension::kNone);
-  JAX_ASSIGN_OR_RETURN(
-      std::vector<uint8_t> module_image,
-      stream_executor::CompileGpuAsm(cc, std::string(ptx),
-                                     stream_executor::GpuAsmOpts{}));
+
+  std::vector<std::string> ptxas_extra_flags =
+      absl::GetFlag(FLAGS_jax_triton_ptxas_extra_flags);
+  if (absl::GetFlag(FLAGS_jax_triton_ptxas_device_debug) ||
+      absl::c_find_if(ptxas_extra_flags, [](const std::string& flag) {
+        return flag == "--device-debug" || flag == "-g";
+      }) == ptxas_extra_flags.end()) {
+    ptxas_extra_flags.push_back("--device-debug");
+  }
+
+  VLOG(1) << absl::StreamFormat(
+      "ptxas_extra_flags = {%s}",
+      absl::StrJoin(ptxas_extra_flags, ", ",
+                    [](std::string* s, absl::string_view v) {
+                      absl::StrAppend(s, absl::CEscape(v));
+                    }));
+
+  JAX_ASSIGN_OR_RETURN(std::vector<uint8_t> module_image,
+                       stream_executor::CompileGpuAsm(
+                           cc, std::string(ptx),
+                           stream_executor::GpuAsmOpts(
+                               /*disable_gpuasm_optimizations=*/false,
+                               /*preferred_cuda_dir=*/"", ptxas_extra_flags)));
 #endif
 
   auto [it2, success] = module_images.insert(
