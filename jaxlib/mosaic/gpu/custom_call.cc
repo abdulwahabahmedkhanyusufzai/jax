@@ -467,15 +467,6 @@ absl::StatusOr<CompiledKernel> Compile(llvm::StringRef module_str) {
   TF_ASSIGN_OR_RETURN(std::string ptx_isa,
                       GetPtxIsaVersion(*compilation_provider));
   bool is_comm_used = is_nvshmem_used(*module);
-  std::string nvshmem_path = "";
-  if (is_comm_used) {
-    TF_ASSIGN_OR_RETURN(nvshmem_path, get_nvshmem_llvm_lib_path());
-    if (!NvshmemApi::Default(/*assert_ok=*/false).is_loaded()) {
-      return absl::InternalError(
-          "Failed to load the NVSHMEM library. Make sure it is installed (e.g. "
-          "`pip install nvidia-nvshmem-cu12`).");
-    }
-  }
   const char* dump_llvm = getenv("MOSAIC_GPU_DUMP_LLVM");
   const char* llvm_debug_only = getenv("MOSAIC_GPU_LLVM_DEBUG_ONLY");
 #ifndef NDEBUG
@@ -507,6 +498,10 @@ absl::StatusOr<CompiledKernel> Compile(llvm::StringRef module_str) {
     abort();
   }
 #endif
+  std::string nvshmem_path = "";
+  if (is_comm_used) {
+    TF_ASSIGN_OR_RETURN(nvshmem_path, get_nvshmem_llvm_lib_path());
+  }
   // Use `div.full` for float32 division---this generates better SASS.
   const std::vector<std::string> llvm_cl_options{"-nvptx-prec-divf32=1"};
   // Acquire a lock over the LLVM command line options here. XLA uses this
@@ -596,7 +591,14 @@ absl::StatusOr<CompiledKernel*> CachedCompile(const KernelHash& kernel_hash,
   return &cache->kernels.at(kernel_hash);
 }
 
-void* InitKernel(const CompiledKernel& kernel) {
+absl::StatusOr<void*> InitKernel(const CompiledKernel& kernel) {
+  if (kernel.is_comm_used &&
+      !NvshmemApi::Default(/*assert_ok=*/false).is_loaded()) {
+    return absl::InternalError(
+        "Failed to load the NVSHMEM library. Make sure it is installed (e.g. "
+        "`pip install nvidia-nvshmem-cu12`).");
+  }
+
   void* module_ptr = nullptr;
   void* kernel_ptr = nullptr;
   void** module_ptr_ptr = &module_ptr;
@@ -624,12 +626,11 @@ absl::StatusOr<void*> CachedInit(const CompiledKernel& kernel) {
   absl::MutexLock lock(cache->mutex);
   auto it = cache->contexts.find(key);
   if (it != cache->contexts.end()) return it->second;
-  void* context = InitKernel(kernel);
+  TF_ASSIGN_OR_RETURN(auto context, InitKernel(kernel));
   cache->contexts.insert_or_assign(key, context);
   return context;
 }
 
-// TODO(b/464203195): Inline once the legacy custom call is removed.
 absl::Status MosaicGPUCustomCallImpl(cudaStream_t stream, void** buffers,
                                      const KernelHash& hash,
                                      llvm::StringRef module) {
@@ -661,11 +662,15 @@ void MosaicGPUCustomCall(void* stream, void** buffers, char* opaque,
 XLA_REGISTER_CUSTOM_CALL_TARGET_WITH_SYM("mosaic_gpu", &MosaicGPUCustomCall,
                                          "CUDA");
 
-absl::Status MosaicGpuExecute(cudaStream_t stream, ffi::RemainingArgs inputs,
-                              ffi::RemainingRets results,
-                              std::string_view kernel_hash,
-                              std::string_view module,
-                              bool use_custom_barrier) {
+struct CustomCallResources {
+  // TODO(allanrenucci): Remove explicit constructor after C++20.
+  explicit CustomCallResources(CompiledKernel* kernel) : kernel(kernel) {}
+  CompiledKernel* kernel;
+};
+
+absl::StatusOr<std::unique_ptr<CustomCallResources>> InstantiateResources(
+    std::string_view kernel_hash, std::string_view module,
+    bool use_custom_barrier) {
   if (use_custom_barrier) {
     return absl::UnimplementedError("Custom barrier is not supported on GPUs.");
   }
@@ -676,7 +681,13 @@ absl::Status MosaicGpuExecute(cudaStream_t stream, ffi::RemainingArgs inputs,
   }
   KernelHash hash;
   std::memcpy(hash.data(), kernel_hash.data(), sizeof(KernelHash));
+  TF_ASSIGN_OR_RETURN(CompiledKernel* kernel, CachedCompile(hash, module));
+  return std::make_unique<CustomCallResources>(kernel);
+}
 
+absl::Status MosaicGpuExecute(cudaStream_t stream, ffi::RemainingArgs inputs,
+                              ffi::RemainingRets results,
+                              CustomCallResources* resources) {
   std::vector<void*> buffers;
   buffers.reserve(inputs.size() + results.size());
   for (int i = 0; i < inputs.size(); ++i) {
@@ -698,22 +709,33 @@ absl::Status MosaicGpuExecute(cudaStream_t stream, ffi::RemainingArgs inputs,
     }
   }
 
-  return MosaicGPUCustomCallImpl(stream, buffers.data(), hash, module);
+  CompiledKernel* kernel = resources->kernel;
+  TF_ASSIGN_OR_RETURN(auto ctx, CachedInit(*kernel));
+  if (kernel->is_comm_used) {
+    NvshmemApi::Default().barrier_all_on_stream(stream);
+  }
+  void* args[4] = {&ctx, &stream, &buffers};
+  kernel->host_launch(args);
+  return absl::OkStatus();
 }
+
+XLA_FFI_DEFINE_HANDLER(kMosaicInstantiate, InstantiateResources,
+                       ffi::Ffi::BindInstantiate()
+                           .Attr<std::string_view>("kernel_hash")
+                           .Attr<std::string_view>("module")
+                           .Attr<bool>("use_custom_barrier"));
 
 XLA_FFI_DEFINE_HANDLER(kMosaicGpuExecute, MosaicGpuExecute,
                        ffi::Ffi::Bind<ffi::ExecutionStage::kExecute>()
                            .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
                            .RemainingArgs()
                            .RemainingRets()
-                           .Attr<std::string_view>("kernel_hash")
-                           .Attr<std::string_view>("module")
-                           .Attr<bool>("use_custom_barrier"),
+                           .Ctx<xla::ffi::State<CustomCallResources>>(),
                        {ffi::Traits::kCmdBufferCompatible});
 
 XLA_FFI_REGISTER_HANDLER(ffi::GetXlaFfiApi(), "mosaic_gpu_v2", "CUDA",
                          {
-                             /*instantiate=*/nullptr,
+                             /*instantiate=*/kMosaicInstantiate,
                              /*prepare=*/nullptr,
                              /*initialize=*/nullptr,
                              /*execute=*/kMosaicGpuExecute,
@@ -731,8 +753,11 @@ __attribute__((visibility("default"))) void** MosaicGpuCompile(
     return nullptr;
   }
   auto ctx = InitKernel(*kernel);
+  if (!ctx.ok()) {
+    return nullptr;
+  }
   auto tuple_ptr = new void*[3];
-  tuple_ptr[0] = ctx;
+  tuple_ptr[0] = *ctx;
   tuple_ptr[1] = reinterpret_cast<void*>(kernel->host_launch);
   tuple_ptr[2] = new CompiledKernel(std::move(*kernel));
   return tuple_ptr;
