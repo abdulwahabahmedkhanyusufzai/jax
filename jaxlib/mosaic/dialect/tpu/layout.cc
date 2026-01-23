@@ -110,13 +110,38 @@ class SingleRowVRegBounds : public VRegDataBounds {
       return arith::ConstantOp::create(builder, loc, i32_vreg,
                                        DenseElementsAttr::get(i32_vreg, v));
     };
+    // The only restriction we need is the final mask should be contiguous along
+    // the lanes. This is naturally true for 32-bit values. For smaller
+    // bitwidths, it is subtle because the data is vertically packed, e.g., for
+    // a 1d bf16 array with tiling (1, 256), element 0 is packed together with
+    // element 128, not element 1, if `start_offset_ = 0` and `stop_offset_ =
+    // 128`, the correct mask should start at 0 and end at 128, not 64.
+    // To be realistic and not too relaxed, we only require `start_offset_` to
+    // be aligned to sublanes, while `stop_offset_` can be anywhere.
     if (layout_.bitwidth() != 32 &&
-        (start_offset_ % (target_shape[1] * layout_.packing()) != 0 ||
-         stop_offset_ % (target_shape[1] * layout_.packing()) != 0)) {
-      return emitError(loc, "Not implemented: offset not aligned to sublanes");
+        start_offset_ % (target_shape[1] * layout_.packing()) != 0) {
+      return emitError(loc,
+                       "Not implemented: start offset not aligned to sublanes");
     }
-    const Value start = getI32VregConstant(start_offset_ / layout_.packing());
-    const Value end = getI32VregConstant(stop_offset_ / layout_.packing());
+
+    const int32_t offset_diff = stop_offset_ - start_offset_;
+    // Basically, the `i32_offset_diff` is a piecewise linear function of the
+    // `offset_diff`: if the non aligned part `offset_diff_num_extra_lanes` is
+    // smaller than `target_shape[1]`, the mask needs to cover the exact
+    // `offset_diff_num_extra_lanes` lanes due to vertical packing; otherwise,
+    // the mask needs to cover the whole last sublane.
+    const int32_t offset_diff_num_full_sublanes =
+        offset_diff / (target_shape[1] * layout_.packing());
+    const int32_t offset_diff_num_extra_lanes =
+        offset_diff % (target_shape[1] * layout_.packing());
+    const int32_t i32_offset_diff =
+        offset_diff_num_extra_lanes < target_shape[1]
+            ? offset_diff_num_extra_lanes +
+                  target_shape[1] * offset_diff_num_full_sublanes
+            : target_shape[1] * (offset_diff_num_full_sublanes + 1);
+    const int32_t i32_start_offset = start_offset_ / layout_.packing();
+    const Value start = getI32VregConstant(i32_start_offset);
+    const Value end = getI32VregConstant(i32_start_offset + i32_offset_diff);
     const Value iota =
         tpu::IotaOp::create(builder, loc, i32_vreg, ArrayRef<int32_t>{0, 1});
     return cast<TypedValue<VectorType>>(
