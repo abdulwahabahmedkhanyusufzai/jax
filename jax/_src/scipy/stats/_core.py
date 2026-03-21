@@ -139,6 +139,32 @@ def invert_permutation(i: Array) -> Array:
   """Helper function that inverts a permutation array."""
   return jnp.empty_like(i).at[i].set(jnp.arange(i.size, dtype=i.dtype))
 
+def _rankdata_impl(a, method):
+  """Internal helper for core ranking logic on a clean array"""
+  arr = jnp.ravel(a)
+  arr, sorter = lax.sort_key_val(arr, jnp.arange(arr.size))
+  inv = invert_permutation(sorter)
+
+  if method == "ordinal":
+    return (inv + 1)
+    
+  obs = jnp.concatenate([jnp.array([True]), arr[1:] != arr[:-1]])
+  dense = obs.cumsum()[inv]
+
+  if method == "dense":
+    return dense
+
+  count = jnp.nonzero(obs, size=arr.size + 1, fill_value=obs.size)[0]
+  
+  if method == "min":
+    return count[dense - 1] + 1
+  if method == "max":
+    return count[dense]
+  if method == "average":
+    return 0.5 * (count[dense] + count[dense-1] + 1)
+
+  raise ValueError(f"unknown method '{method}'")
+
 
 @api.jit(static_argnames=["method", "axis", "nan_policy"])
 def rankdata(
@@ -199,26 +225,18 @@ def rankdata(
   a = jnp.asarray(a)
 
   if axis is not None:
-    return jnp.apply_along_axis(rankdata, axis, a, method)
+    return jnp.apply_along_axis(rankdata, axis, a, method, nan_policy=nan_policy)
 
-  arr = jnp.ravel(a)
-  arr, sorter = lax.sort_key_val(arr, jnp.arange(arr.size))
-  inv = invert_permutation(sorter)
+  out_dtype = jnp.result_type(a, 0.0)
+  
+  has_nan = jnp.any(jnp.isnan(a))
 
-  if method == "ordinal":
-    return inv + 1
-  obs = jnp.concatenate([jnp.array([True]), arr[1:] != arr[:-1]])
-  dense = obs.cumsum()[inv]
-  if method == "dense":
-    return dense
-  count = jnp.nonzero(obs, size=arr.size + 1, fill_value=obs.size)[0]
-  if method == "max":
-    return count[dense]
-  if method == "min":
-    return count[dense - 1] + 1
-  if method == "average":
-    return .5 * (count[dense] + count[dense - 1] + 1).astype(dtypes.default_float_dtype())
-  raise ValueError(f"unknown method '{method}'")
+  return lax.cond(
+    has_nan,
+    lambda _: jnp.full(a.shape, jnp.nan, dtype=out_dtype),
+    lambda _: _rankdata_impl(a, method).astype(out_dtype),
+    operand=None
+  )
 
 
 @api.jit(static_argnames=['axis', 'nan_policy', 'keepdims'])
